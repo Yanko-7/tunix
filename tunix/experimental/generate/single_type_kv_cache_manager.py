@@ -36,6 +36,7 @@ import dataclasses
 from typing import Any
 
 import tunix.experimental.generate.tiered_page_pool as page_pool_lib
+from tunix.generate import utils
 
 
 @dataclasses.dataclass
@@ -89,6 +90,13 @@ class SingleTypeKVCacheManager:
         collections.OrderedDict()
     )
 
+  @property
+  def _num_pages_in_window(self) -> int:
+    if self._window_size is None:
+      return 0
+    # Add 1 to account for the window sliding and leaking into the next page.
+    return utils.cdiv(self._window_size, self._page_size) + 1
+
   def _touch_page(self, page: Page | None) -> None:
     """Increments a page's reference count."""
     if page is None:
@@ -122,9 +130,9 @@ class SingleTypeKVCacheManager:
       # If a page was never hashed, it cannot be reused and should be freed
       # immediately.
       self._free_pages([page])
-    elif location == "device":
+    elif location == page_pool_lib.PageLocation.DEVICE:
       self._unreferenced_device_pages[page] = None
-    elif location == "host":
+    elif location == page_pool_lib.PageLocation.HOST:
       self._unreferenced_host_pages[page] = None
     else:
       raise ValueError(f"Unknown page location: {location}")
@@ -213,3 +221,175 @@ class SingleTypeKVCacheManager:
         for _ in range(num_pages)
     ]
     self._free_pages(pages)
+
+  def _release_out_of_window(
+      self, request_id: str, num_completed_tokens: int
+  ):
+    """Release pages outside the sliding window for a request."""
+    if self._window_size is None:
+      return
+
+    pages = self._request_to_pages.get(request_id)
+    if not pages:
+      return
+
+    lowest_needed_token_idx = max(
+        0, num_completed_tokens - self._window_size
+    )
+    lowest_needed_page_idx = min(
+        lowest_needed_token_idx // self._page_size,
+        len(pages) - 1,
+    )
+
+    idxs_to_release: list[int] = []
+    for i in range(lowest_needed_page_idx - 1, -1, -1):
+      if pages[i] is None:
+        break
+
+      idxs_to_release.append(i)
+
+    # Unreferenced pages are freed lazily in LRU order when space is needed.
+    # Low index pages are released first to ensure they are freed first.
+    # This allows pages near the window to still prefix match.
+    for i in reversed(idxs_to_release):
+      self._release_page(pages[i])
+      pages[i] = None
+
+  def _cache_full_pages(
+      self,
+      request_id: str,
+      page_hashes: Sequence[int],
+      num_completed_tokens: int,
+  ):
+    """Caches newly completed full pages."""
+
+    pages = self._request_to_pages.get(request_id)
+    if not pages:
+      return
+
+    n_complete_pages = num_completed_tokens // self._page_size
+    n_hashed = min(len(page_hashes), len(pages), n_complete_pages)
+    for i in range(n_hashed - 1, -1, -1):
+      page = pages[i]
+      prefix_hash = page_hashes[i]
+
+      if page is None or page.prefix_hash is not None:
+        # If this page is released or already cached,
+        # so are all previous pages.
+        break
+
+      cached_page = self._prefix_hash_to_page.get(prefix_hash)
+      cached_location = (
+          self._page_manager.page_location(cached_page.page_id)
+          if cached_page is not None
+          else None
+      )
+
+      if cached_page is None:
+        page.prefix_hash = prefix_hash
+        self._prefix_hash_to_page[prefix_hash] = page
+      elif cached_location == page_pool_lib.PageLocation.DEVICE:
+        # On a device hit, the cached page cannot be freed as it may be
+        # referenced. Reuse the cached page instead. `page` is never hashed,
+        # so releasing it frees it immediately.
+        pages[i] = cached_page
+        self._release_page(page)
+        self._touch_page(cached_page)
+      elif cached_location == page_pool_lib.PageLocation.HOST:
+        # On a host hit, the cached page must be unreferenced.
+        # To avoid an unnecessary transfer, free the cached page,
+        # and rebind the hash to `page`.
+
+        assert cached_page.ref_count == 0, "Host page must be unreferenced"
+        # Rebind the prefix first so that the cached host page is freed
+        # immediately.
+        page.prefix_hash = prefix_hash
+        self._prefix_hash_to_page[prefix_hash] = page
+        self._free_pages([cached_page])
+      else:
+        raise ValueError(
+            f"Unknown cached page location: {cached_location}"
+        )
+
+  def sync_request_state(
+      self,
+      request_id: str,
+      page_hashes: Sequence[int],
+      num_completed_tokens: int,
+  ):
+    """Syncs the request state for the given request.
+
+    Args:
+      request_id: The ID of the request to sync.
+      page_hashes: The hashes of the request's pages in order.
+      num_completed_tokens: The number of tokens completed by the request.
+    """
+    # Pages must be cached before release, since uncached pages are freed
+    # upon release.
+
+    self._cache_full_pages(request_id, page_hashes, num_completed_tokens)
+    self._release_out_of_window(request_id, num_completed_tokens)
+
+  def _longest_cache_hit_full_attention(
+      self,
+      page_hashes: Sequence[int]
+  ) -> list[Page | None]:
+    """Finds the longest kv cache hit for a group of full attention layers."""
+    cache_hits: list[Page | None] = []
+    for h in page_hashes:
+      page = self._prefix_hash_to_page.get(h)
+      if page is None:
+        break
+
+      cache_hits.append(page)
+
+    return cache_hits
+
+  def _longest_cache_hit_local_attention(
+      self,
+      page_hashes: Sequence[int]
+  ) -> list[Page | None]:
+    """Finds the longest kv cache hit for a group of local attention layers."""
+    # Entries for pages outside the window should be `None`. Otherwise,
+    # they will be unnecessarily loaded and referenced.
+    cache_hits: list[Page | None] = [None] * len(page_hashes)
+
+    def find_miss(w_start: int, w_end: int) -> int:
+      """Scans right to left for a page miss in the window."""
+      for i in range(w_end, w_start - 1, -1):
+        h = page_hashes[i]
+        page = self._prefix_hash_to_page.get(h)
+        if page is None:
+          return i
+      return -1
+
+    w_end = len(cache_hits) - 1
+    w_start = 0
+    while w_end >= 0:
+      w_start = max(0, w_end - self._num_pages_in_window + 1)
+
+      miss_idx = find_miss(w_start, w_end)
+      if miss_idx >= 0:
+        w_end = miss_idx - 1
+        continue
+
+      break
+
+    for i in range(w_start, w_end + 1):
+      cache_hits[i] = self._prefix_hash_to_page[page_hashes[i]]
+
+    return cache_hits[:w_end + 1]
+
+  def find_longest_cache_hit(
+      self,
+      page_hashes: Sequence[int]
+  ) -> list[Page | None]:
+    """Queries the prefix cache for pages matching page_hashes."""
+    if self._window_size is None:
+      return self._longest_cache_hit_full_attention(
+          page_hashes
+      )
+
+    return self._longest_cache_hit_local_attention(
+        page_hashes
+    )
