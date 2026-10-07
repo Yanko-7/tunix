@@ -130,6 +130,18 @@ export TRAINER_TPU_SLICE=${TRAINER_TPU_SLICE:-tpuv5:2x2x2}
 export TRAINER_MESH_FSDP=${TRAINER_MESH_FSDP:-8}
 export ROLLOUT_TPU_SLICE=${ROLLOUT_TPU_SLICE:-tpuv5:2x2x1}
 
+# JAX compilation cache configuration
+export LOCAL_JAX_CACHE_DIR=${LOCAL_JAX_CACHE_DIR:-${JAX_CACHE_DIR:-/tmp/jax_cache}}
+export JAX_CACHE_GCS_DIR=${JAX_CACHE_GCS_DIR:-}
+export ROLLOUT_JAX_CACHE_GCS_DIR=${ROLLOUT_JAX_CACHE_GCS_DIR:-}
+export SAVE_JAX_CACHE=${SAVE_JAX_CACHE:-true}
+export SKIP_JAX_PRECOMPILE=${SKIP_JAX_PRECOMPILE:-1}
+export ROLLOUT_SKIP_JAX_PRECOMPILE=${ROLLOUT_SKIP_JAX_PRECOMPILE:-${SKIP_JAX_PRECOMPILE}}
+if [[ -z "${ROLLOUT_JAX_CACHE_GCS_DIR}" && "${DISABLE_JAX_CACHE:-false}" != "true" && "${DISABLE_JAX_CACHE:-0}" != "1" ]]; then
+  ROLLOUT_JAX_CACHE_GCS_DIR=$("$PYTHON" -m tunix.experimental.common.gcs_cache resolve-uri 2>/dev/null || true)
+fi
+export EVAL_JAX_CACHE_GCS_DIR=${EVAL_JAX_CACHE_GCS_DIR:-${ROLLOUT_JAX_CACHE_GCS_DIR}}
+
 export TRAINER_EXTRA_ENV=${TRAINER_EXTRA_ENV:-}
 export DRY_RUN=${DRY_RUN:-false}
 
@@ -170,6 +182,21 @@ start_orchestrator() {
     sandbox_arg="--use_agent_sandbox"
   fi
 
+  local jax_cache_env=""
+  if [[ "${DISABLE_JAX_CACHE:-0}" == "1" || "${DISABLE_JAX_CACHE:-false}" == "true" ]]; then
+    jax_cache_env+=" DISABLE_JAX_CACHE=1"
+  else
+    if [[ -n "${JAX_CACHE_GCS_DIR}" ]]; then
+      jax_cache_env+=" JAX_CACHE_GCS_DIR=\"${JAX_CACHE_GCS_DIR}\""
+    fi
+    if [[ -n "${ROLLOUT_JAX_CACHE_GCS_DIR}" ]]; then
+      jax_cache_env+=" ROLLOUT_JAX_CACHE_GCS_DIR=\"${ROLLOUT_JAX_CACHE_GCS_DIR}\""
+    fi
+    if [[ -n "${SAVE_JAX_CACHE}" ]]; then
+      jax_cache_env+=" SAVE_JAX_CACHE=\"${SAVE_JAX_CACHE}\""
+    fi
+  fi
+
   "$PYTHON" tunix/experimental/distributed/deployment/yaml_generator.py \
     tunix/experimental/distributed/deployment/yamls/jobset.cpu.yaml \
     --jobset_name="${ORCHESTRATOR_ID}" \
@@ -184,7 +211,7 @@ start_orchestrator() {
       ${TRAJECTORY_LOG_DIR:+TRAJECTORY_LOG_DIR=\"${TRAJECTORY_LOG_DIR}\"} \
       WANDB_PROJECT=\"${WANDB_PROJECT}\" \
       WANDB_RUN_NAME=\"${WANDB_RUN_NAME}\" \
-      python -m tunix.experimental.distributed.runtime.main \
+      ${jax_cache_env} python -m tunix.experimental.distributed.runtime.main \
         --discovery_id=${ORCHESTRATOR_ID} \
         --discovery_port=${ORCHESTRATOR_PORT} \
         --process_main=tunix.experimental.examples.deepswe_dist.run_deepswe_dist.main \
@@ -349,6 +376,32 @@ start_rollout() {
   if [[ "$USE_AGENT_SANDBOX" == "1" || "$USE_AGENT_SANDBOX" == "true" || "$USE_AGENT_SANDBOX" == "True" ]]; then
     sandbox_env="NAMESPACE=\"${SANDBOX_NAMESPACE}\" ${SANDBOX_NODE_SELECTOR_KEY:+NODE_SELECTOR_KEY=\"${SANDBOX_NODE_SELECTOR_KEY}\"} ${SANDBOX_NODE_SELECTOR_VAL:+NODE_SELECTOR_VAL=\"${SANDBOX_NODE_SELECTOR_VAL}\"}"
   fi
+  if [[ -n "${ROLLOUT_JAX_CACHE_GCS_DIR}" && "${DISABLE_JAX_CACHE:-false}" != "true" && "${DISABLE_JAX_CACHE:-0}" != "1" ]]; then
+    echo "[launcher] Rollout JAX cache GCS: ${ROLLOUT_JAX_CACHE_GCS_DIR} (save=${SAVE_JAX_CACHE:-true})" >&2
+  fi
+  local jax_cache_env=" ROLLOUT_TPU_SLICE=\"${ROLLOUT_TPU_SLICE}\""
+  if [[ "${DISABLE_JAX_CACHE:-0}" == "1" || "${DISABLE_JAX_CACHE:-false}" == "true" ]]; then
+    jax_cache_env+=" DISABLE_JAX_CACHE=1"
+  else
+    if [[ -n "${ROLLOUT_JAX_CACHE_GCS_DIR}" ]]; then
+      jax_cache_env+=" ROLLOUT_JAX_CACHE_GCS_DIR=\"${ROLLOUT_JAX_CACHE_GCS_DIR}\""
+    fi
+    if [[ -n "${JAX_CACHE_GCS_DIR}" ]]; then
+      jax_cache_env+=" JAX_CACHE_GCS_DIR=\"${JAX_CACHE_GCS_DIR}\""
+    fi
+    if [[ -n "${JAX_CACHE_BUCKET}" ]]; then
+      jax_cache_env+=" JAX_CACHE_BUCKET=\"${JAX_CACHE_BUCKET}\""
+    fi
+    if [[ -n "${BUCKET}" ]]; then
+      jax_cache_env+=" BUCKET=\"${BUCKET}\""
+    fi
+    if [[ -n "${MAXTEXT_OUTPUT_DIR}" ]]; then
+      jax_cache_env+=" MAXTEXT_OUTPUT_DIR=\"${MAXTEXT_OUTPUT_DIR}\""
+    fi
+    if [[ -n "${SAVE_JAX_CACHE}" ]]; then
+      jax_cache_env+=" SAVE_JAX_CACHE=\"${SAVE_JAX_CACHE}\""
+    fi
+  fi
   "$PYTHON" tunix/experimental/distributed/deployment/yaml_generator.py \
     tunix/experimental/distributed/deployment/yamls/jobset.tpu.yaml \
     --jobset_name="${ROLLOUT_ID}" \
@@ -358,7 +411,7 @@ start_rollout() {
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${ROLLOUT_PORT}" \
     --worker_startup_command=" \
-      SKIP_JAX_PRECOMPILE=1 VERIFY_WEIGHTS=${VERIFY_WEIGHTS} ${sandbox_env} ${ROLLOUT_USE_BATCHED_RPA:+USE_BATCHED_RPA_KERNEL=1} python -m tunix.experimental.distributed.runtime.main \
+      SKIP_JAX_PRECOMPILE=${ROLLOUT_SKIP_JAX_PRECOMPILE} VERIFY_WEIGHTS=${VERIFY_WEIGHTS} ${sandbox_env} ${ROLLOUT_USE_BATCHED_RPA:+USE_BATCHED_RPA_KERNEL=1}${jax_cache_env} python -m tunix.experimental.distributed.runtime.main \
         --discovery_addrs=${ORCHESTRATOR_ID}:${ORCHESTRATOR_PORT} \
         --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor \
         --process_main=tunix.experimental.examples.common.run_rollout_node.main \

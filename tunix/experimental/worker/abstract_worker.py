@@ -25,9 +25,11 @@ import contextlib
 import contextvars
 import functools
 import inspect
+import pathlib
 from typing import Any, Callable
 
 from tunix.experimental.common import datatypes
+from tunix.experimental.common import gcs_cache
 
 _ACTIVE_WORKERS: contextvars.ContextVar[frozenset[int]] = (
     contextvars.ContextVar("active_workers", default=frozenset())
@@ -190,3 +192,11 @@ class Worker(abc.ABC):
   def heartbeat(self) -> datatypes.HealthReport:
     """Returns the current health status of the worker."""
     pass
+
+  def upload_jax_cache(
+      self,
+      gcs_uri: str | None = None,
+      local_dir: str | pathlib.Path | None = None,
+  ) -> bool:
+    """Persists JAX compilation cache from local_dir to GCS."""
+    return gcs_cache.save_jax_cache(gcs_uri=gcs_uri, local_dir=local_dir)

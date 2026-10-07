@@ -238,12 +238,15 @@ class RLStepResult:
 class RLProgram(abc.ABC):
   """Base class for multi-stage DAG workflows."""
 
+  on_step_end: Callable[[int, Any], None] | None = None
+
   def __init__(self):
     self._is_running = False
     self._step = 0
     self.policy_version = 0
     self.last_step_result: RLStepResult | None = None
     self.engine: rl_engine_interface.AbstractRLEngine | None = None
+    self.on_step_end: Callable[[int, Any], None] | None = None
 
   @property
   def step(self) -> int:

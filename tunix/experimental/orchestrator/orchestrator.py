@@ -19,15 +19,17 @@ Provides supervised RL program execution (`run`).
 """
 
 import collections
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent import futures
 import contextlib
 import pickle
+import threading
 import time
 from typing import Any, Mapping
 
 from absl import logging
 from tunix.experimental.common import datatypes
+from tunix.experimental.common import gcs_cache
 from tunix.experimental.orchestrator import distributed_rl_engine
 from tunix.experimental.orchestrator import health_monitor
 from tunix.experimental.orchestrator import lifecycle
@@ -54,6 +56,7 @@ class ClusterOrchestrator:
       monitor: health_monitor.HealthMonitor | None = None,
       weight_sync_mode: str | None = None,
       trajectory_store_config: Mapping[str, Any] | None = None,
+      jax_cache_config: gcs_cache.JaxCacheConfig | None = None,
   ):
     """Initializes ClusterOrchestrator.
 
@@ -63,12 +66,13 @@ class ClusterOrchestrator:
       lifecycle_driver: Lifecycle driver to use; one is created if omitted.
       monitor: Health monitor to use; one is created if omitted.
       weight_sync_mode: Weight sync mode, if any.
-      trajectory_store_config: Trajectory Store configuration for this
-        process, or None to run without a store. See
-        `store.TrajectoryStore.from_config`. Pass the same config to every
-        process in the run: for the file backend it is the shared root_dir
-        and run_id that will make the workers' writes visible to this
-        process's reads once read/write wiring is connected.
+      trajectory_store_config: Trajectory Store configuration for this process,
+        or None to run without a store. See `store.TrajectoryStore.from_config`.
+        Pass the same config to every process in the run: for the file backend
+        it is the shared root_dir and run_id that will make the workers' writes
+        visible to this process's reads once read/write wiring is connected.
+      jax_cache_config: Optional typed JAX compilation cache configuration.
+        Defaults to `gcs_cache.JaxCacheConfig.from_env()`.
     """
     self.config = config
     self.registry = registry or worker_registry.WorkerRegistry()
@@ -86,6 +90,14 @@ class ClusterOrchestrator:
     self.engine: distributed_rl_engine.DistributedRLEngine | None = None
     mode = getattr(weight_sync_mode, "value", weight_sync_mode)
     self._weight_sync_mode = str(mode).lower() if mode is not None else None
+    self.jax_cache_config: gcs_cache.JaxCacheConfig = (
+        jax_cache_config
+        if jax_cache_config is not None
+        else gcs_cache.JaxCacheConfig.from_env()
+    )
+    self._pending_jax_cache_sync: (
+        tuple[futures.Future[bool], str, float] | None
+    ) = None
     # The sole construction site for this process's Trajectory Store: one
     # ClusterOrchestrator exists per orchestrator process, so building it
     # here — once, in __init__ — is the whole guard. Its lifetime is meant
@@ -156,6 +168,10 @@ class ClusterOrchestrator:
       case _:
         raise RuntimeError(f"unknown service type {service_type}")
 
+    worker_resources: dict[str, str] = {"address": service_address}
+    if "jax_cache_gcs_dir" in md and md["jax_cache_gcs_dir"]:
+      worker_resources["jax_cache_gcs_dir"] = str(md["jax_cache_gcs_dir"])
+
     self.register_worker_handle(
         worker_id=worker_id,
         roles=[role],
@@ -163,7 +179,7 @@ class ClusterOrchestrator:
             f"grpc://{service_address}",
             rpc_timeout_s=rpc_timeout_s,
         ),
-        resources={"address": service_address},
+        resources=worker_resources,
     )
 
   def register_worker(
@@ -289,6 +305,151 @@ class ClusterOrchestrator:
     """Returns handles for all workers (remote and local) registered under the given role."""
     return self._get_actor_handles(role)
 
+  def _resolve_rollout_gcs_uri(
+      self, primary_worker_id: str | None = None
+  ) -> str | None:
+    """Resolves the target rollout GCS compilation cache URI, if configured."""
+    if self.jax_cache_config.rollout_jax_cache_gcs_dir:
+      return self.jax_cache_config.rollout_jax_cache_gcs_dir
+    if (
+        primary_worker_id is not None
+        and primary_worker_id in self._remote_worker_infos
+    ):
+      resources = self._remote_worker_infos[primary_worker_id].resources
+      if "jax_cache_gcs_dir" in resources and resources["jax_cache_gcs_dir"]:
+        return str(resources["jax_cache_gcs_dir"])
+    for w_id in sorted(self._remote_worker_infos):
+      info = self._remote_worker_infos[w_id]
+      if (
+          datatypes.Role.ROLLOUT.value in info.roles
+          and "jax_cache_gcs_dir" in info.resources
+          and info.resources["jax_cache_gcs_dir"]
+      ):
+        return str(info.resources["jax_cache_gcs_dir"])
+    if self.jax_cache_config.jax_cache_gcs_dir:
+      return self.jax_cache_config.jax_cache_gcs_dir
+    return None
+
+  def _await_jax_cache_upload(
+      self, pending: tuple[futures.Future[bool], str, float]
+  ) -> None:
+    """Waits for a specific JAX cache upload future and logs its outcome."""
+    outcome, primary_worker_id, sync_timeout_s = pending
+    try:
+      uploaded = outcome.result(timeout=sync_timeout_s)
+    except futures.TimeoutError:
+      logging.warning(
+          "JAX cache upload on worker %s timed out after %.0fs; abandoning it.",
+          primary_worker_id,
+          sync_timeout_s,
+      )
+      return
+    except Exception as err:  # pylint: disable=broad-except
+      logging.warning(
+          "Failed to sync JAX cache on worker %s: %r", primary_worker_id, err
+      )
+      return
+    if uploaded is not None and not uploaded:
+      logging.warning(
+          "Worker %s reported a failed JAX cache upload.", primary_worker_id
+      )
+      return
+    logging.info("Worker %s JAX cache upload finished.", primary_worker_id)
+
+  def _wait_for_jax_cache_sync(self) -> None:
+    """Waits for any in-flight background JAX cache upload to finish."""
+    if self._pending_jax_cache_sync is None:
+      return
+    pending = self._pending_jax_cache_sync
+    self._pending_jax_cache_sync = None
+    self._await_jax_cache_upload(pending)
+
+  def sync_jax_cache(self, *, wait: bool = True) -> futures.Future[bool] | None:
+    """Synchronizes JAX compilation cache from the primary rollout worker to GCS.
+
+    Args:
+      wait: If True, blocks until the upload completes (or times out). If False,
+        dispatches the upload on a background daemon thread and returns its
+        Future immediately so rollout/training critical paths are not blocked.
+
+    Returns:
+      The upload Future when a rollout worker upload is launched, or None if
+      cache persistence is disabled or inapplicable.
+    """
+    if (
+        not self.jax_cache_config.save_jax_cache
+        or gcs_cache.is_jax_cache_disabled()
+    ):
+      return None
+
+    worker_ids = sorted(self._remote_worker_infos)
+    upload_fn: Callable[[], bool]
+    if not worker_ids:
+      local_rollout_workers = [
+          worker
+          for worker in self.registry.workers()
+          if datatypes.Role.ROLLOUT.value in worker.info().roles
+      ]
+      if not local_rollout_workers:
+        return None
+      local_worker = local_rollout_workers[0]
+      primary_worker_id = local_worker.info().worker_id
+      rollout_gcs_uri = self._resolve_rollout_gcs_uri()
+      if not rollout_gcs_uri:
+        return None
+      upload_fn = lambda: local_worker.upload_jax_cache(gcs_uri=rollout_gcs_uri)
+    else:
+      rollout_worker_ids = [
+          w_id
+          for w_id in worker_ids
+          if datatypes.Role.ROLLOUT.value
+          in self._remote_worker_infos[w_id].roles
+      ]
+      if not rollout_worker_ids:
+        return None
+      primary_worker_id = rollout_worker_ids[0]
+      rollout_gcs_uri = self._resolve_rollout_gcs_uri(primary_worker_id)
+      if not rollout_gcs_uri:
+        return None
+      handle = self._remote_worker_handles_by_id[primary_worker_id]
+      upload_fn = lambda: handle.submit(
+          "upload_jax_cache", gcs_uri=rollout_gcs_uri
+      )
+
+    logging.info(
+        "Triggering JAX compilation cache synchronization to GCS (%s) from"
+        " rollout worker %s (wait=%s)...",
+        rollout_gcs_uri,
+        primary_worker_id,
+        wait,
+    )
+
+    prior_pending = self._pending_jax_cache_sync
+    self._pending_jax_cache_sync = None
+    outcome: futures.Future[bool] = futures.Future()
+
+    def _run() -> None:
+      if prior_pending is not None:
+        self._await_jax_cache_upload(prior_pending)
+      try:
+        outcome.set_result(upload_fn())
+      except Exception as err:  # pylint: disable=broad-except
+        outcome.set_exception(err)
+
+    sync_timeout_s = self.jax_cache_config.sync_timeout_s
+    # Daemon thread: unlike ThreadPoolExecutor workers it is not joined at
+    # interpreter exit, so an abandoned hung RPC (bounded only by the RPC
+    # deadline, which can be hours) cannot block process exit.
+    threading.Thread(
+        target=_run,
+        name=f"jax-cache-upload-{primary_worker_id}",
+        daemon=True,
+    ).start()
+    self._pending_jax_cache_sync = (outcome, primary_worker_id, sync_timeout_s)
+    if wait:
+      self._wait_for_jax_cache_sync()
+    return outcome
+
   def bring_up_workers(self, dummy_data: Any = None) -> None:
     """Brings up all registered workers through lifecycle initialization."""
     logging.info(
@@ -297,6 +458,7 @@ class ClusterOrchestrator:
     )
     self.lifecycle_driver.bring_up(dummy_data)
     self._bring_up_remote_workers(dummy_data)
+    self.sync_jax_cache(wait=False)
     self.engine = self._create_engine()
     logging.info("All workers brought up successfully.")
 
@@ -310,6 +472,7 @@ class ClusterOrchestrator:
         stack.callback(self.trajectory_store.close)
       stack.callback(self.lifecycle_driver.shutdown)
       stack.callback(self._shutdown_remote_workers)
+      stack.callback(self._wait_for_jax_cache_sync)
       stack.callback(self.monitor.close)
     logging.info("Shutdown complete.")
 
@@ -467,8 +630,38 @@ class ClusterOrchestrator:
     logging.info("Executing program %s...", type(program).__name__)
     engine = self.engine or self._create_engine()
 
-    program.run(
-        engine=engine,
-        **kwargs,
+    should_sync_after_first_step = (
+        self.jax_cache_config.save_jax_cache
+        and not gcs_cache.is_jax_cache_disabled()
+        and self._resolve_rollout_gcs_uri() is not None
     )
+    if not should_sync_after_first_step:
+      program.run(
+          engine=engine,
+          **kwargs,
+      )
+      logging.info("Program %s finished.", type(program).__name__)
+      return
+
+    orig_on_step_end = program.on_step_end
+    first_step_synced = False
+
+    def _on_step_end_with_cache_sync(step: int, step_result: Any) -> None:
+      nonlocal first_step_synced
+      if orig_on_step_end is not None:
+        orig_on_step_end(step, step_result)
+      if not first_step_synced:
+        first_step_synced = True
+        self.sync_jax_cache(wait=False)
+
+    program.on_step_end = _on_step_end_with_cache_sync
+    try:
+      program.run(
+          engine=engine,
+          **kwargs,
+      )
+    finally:
+      program.on_step_end = orig_on_step_end
+    if not first_step_synced:
+      self.sync_jax_cache(wait=False)
     logging.info("Program %s finished.", type(program).__name__)
