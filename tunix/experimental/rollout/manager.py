@@ -393,8 +393,13 @@ class RolloutManager:
           trajectory: TrajectoryOrError = await collector.run_episode()
       else:
         trajectory = await collector.run_episode()
+      if hasattr(trajectory, "metadata") and isinstance(
+          trajectory.metadata, dict
+      ):
+        trajectory.metadata.setdefault("request_id", request.request_id)
     except Exception as e:  # pylint: disable=broad-exception-caught
       error_metadata = dict(request.metadata or {})
+      error_metadata["request_id"] = request.request_id
       error_metadata["prompt_id"] = request.prompt_id
       error_metadata["group_index"] = request.group_index
       error_metadata["policy_version"] = int(
